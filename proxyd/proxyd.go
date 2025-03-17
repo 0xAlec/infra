@@ -33,14 +33,6 @@ func Start(config *Config) (*Server, func(), error) {
 		return nil, nil, errors.New("must define at least one RPC method mapping")
 	}
 
-	if config.Authentication != nil {
-		if secret, ok := config.Authentication["secret"]; ok {
-			if secret == "none" {
-				return nil, nil, errors.New("cannot use none as an auth key")
-			}
-		}
-	}
-
 	// redis primary client
 	var redisClient redis.UniversalClient
 	if config.Redis.URL != "" {
@@ -286,26 +278,22 @@ func Start(config *Config) (*Server, func(), error) {
 		}
 	}
 
-	var authenticatedPaths map[string]string
-	var authURL string
+	var resolvedAuth map[string]string = make(map[string]string)
 
 	if config.Authentication != nil {
-		// Check if auth_url is specified in the authentication map
-		if urlVal, ok := config.Authentication["auth_url"]; ok {
-			authURL = urlVal
+		if authURL, ok := config.Authentication["auth_url"]; ok {
+			resolvedAuth["auth_url"] = authURL
 		}
-
-		// Check for traditional secret-based auth
-		if secret, ok := config.Authentication["secret"]; ok {
-			if authURL != "" {
-				return nil, nil, errors.New("cannot specify both auth_url and secrets")
+		for key, alias := range config.Authentication {
+			if key == "auth_url" {
+				continue
 			}
-			authenticatedPaths = make(map[string]string)
-			resolvedSecret, err := ReadFromEnvOrConfig(secret)
+
+			resolvedKey, err := ReadFromEnvOrConfig(key)
 			if err != nil {
 				return nil, nil, err
 			}
-			authenticatedPaths[resolvedSecret] = "default"
+			resolvedAuth[resolvedKey] = alias
 		}
 	}
 
@@ -354,7 +342,7 @@ func Start(config *Config) (*Server, func(), error) {
 		NewStringSetFromStrings(config.WSMethodWhitelist),
 		config.RPCMethodMappings,
 		config.Server.MaxBodySizeBytes,
-		authenticatedPaths,
+		resolvedAuth,
 		secondsToDuration(config.Server.TimeoutSeconds),
 		config.Server.MaxUpstreamBatchSize,
 		config.Server.EnableXServedByHeader,
@@ -365,7 +353,6 @@ func Start(config *Config) (*Server, func(), error) {
 		config.Server.MaxRequestBodyLogLen,
 		config.BatchConfig.MaxSize,
 		limiterFactory,
-		authURL,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error creating server: %w", err)

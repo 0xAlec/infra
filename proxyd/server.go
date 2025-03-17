@@ -1,6 +1,7 @@
 package proxyd
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -83,7 +84,7 @@ type Server struct {
 	cache                  RPCCache
 	srvMu                  sync.Mutex
 	rateLimitHeader        string
-	authURL                string
+	authClient             *http.Client
 }
 
 type limiterFunc func(method string) bool
@@ -107,8 +108,8 @@ func NewServer(
 	maxRequestBodyLogLen int,
 	maxBatchSize int,
 	limiterFactory limiterFactoryFunc,
-	authURL string,
 ) (*Server, error) {
+
 	if cache == nil {
 		cache = &NoopRPCCache{}
 	}
@@ -200,7 +201,9 @@ func NewServer(
 		limExemptOrigins:       limExemptOrigins,
 		limExemptUserAgents:    limExemptUserAgents,
 		rateLimitHeader:        rateLimitHeader,
-		authURL:                authURL,
+		authClient: &http.Client{
+			Timeout: 5 * time.Second,
+		},
 	}, nil
 }
 
@@ -624,6 +627,7 @@ func (s *Server) populateContext(w http.ResponseWriter, r *http.Request) context
 	vars := mux.Vars(r)
 	authorization := vars["authorization"]
 	xff := r.Header.Get(s.rateLimitHeader)
+
 	if xff == "" {
 		ipPort := strings.Split(r.RemoteAddr, ":")
 		if len(ipPort) == 2 {
@@ -638,74 +642,70 @@ func (s *Server) populateContext(w http.ResponseWriter, r *http.Request) context
 		ctx = context.WithValue(ctx, ContextKeyOpTxProxyAuth, opTxProxyAuth) // nolint:staticcheck
 	}
 
-	if s.authURL != "" {
+	// Check if we have an external auth URL configured
+	authURL, hasExternalAuth := s.authenticatedPaths["auth_url"]
+	if hasExternalAuth && authURL != "" { // nolint:staticcheck
 		// Use external authentication service
-		alias, err := s.performAuthCallback(r, authorization)
-		if err != nil {
-			log.Error("auth callback failed", "err", err)
-			w.WriteHeader(http.StatusUnauthorized)
+		alias, err := s.performAuthCallback(r, authURL)
+		if err != nil || alias == "" { // Check both error and empty alias
+			writeRPCError(ctx, w, nil, &RPCErr{Code: -32001, Message: "unauthorized"})
 			return nil
 		}
 		ctx = context.WithValue(ctx, ContextKeyAuth, alias) // nolint:staticcheck
-	} else if len(s.authenticatedPaths) > 0 {
-		// Fallback to traditional auth
-		if authorization == "" || s.authenticatedPaths[authorization] == "" {
-			log.Info("blocked unauthorized request", "authorization", authorization)
-			httpResponseCodesTotal.WithLabelValues("401").Inc()
-			w.WriteHeader(401)
-			return nil
-		}
-
+	} else {
 		ctx = context.WithValue(ctx, ContextKeyAuth, s.authenticatedPaths[authorization]) // nolint:staticcheck
 	}
 	return context.WithValue(ctx, ContextKeyReqID, randStr(10)) // nolint:staticcheck
 }
 
-func (s *Server) performAuthCallback(r *http.Request, apiKey string) (string, error) {
-	// Stub authentication for testing
-	validKeys := []string{
-		"aayushi-key",
-		"v1KtFv89SKPFJhKcTlMWybsPAsfIVX3j",
+func (s *Server) performAuthCallback(r *http.Request, authURL string) (string, error) {
+	// Get the authorization token from the request
+	authorization := mux.Vars(r)["authorization"]
+	if authorization == "" {
+		return "", fmt.Errorf("missing authorization token")
 	}
 
-	// Check if apiKey matches any valid key
-	for _, validKey := range validKeys {
-		if apiKey == validKey {
-			return apiKey, nil
-		}
-	}
-
-	// Return unauthorized for any other key
-	return "", fmt.Errorf("unauthorized")
-
-	/* Original HTTP request logic commented out for now
-	if s.authURL == "" {
-		return "", fmt.Errorf("no auth URL configured")
-	}
-
-	// Create auth request with API key in path
-	authURL := fmt.Sprintf("%s/%s", s.authURL, apiKey)
-	req, err := http.NewRequestWithContext(r.Context(), "POST", authURL, r.Body)
+	// Read the body first
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		return "", err
+		log.Error("performAuthCallback failed to read request body", "err", err)
+		return "", fmt.Errorf("failed to read request body: %w", err)
+	}
+	defer r.Body.Close()
+
+	// Create new body for original request
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Append the token to the auth URL path
+	authURLWithToken := fmt.Sprintf("%s/%s",
+		strings.TrimRight(authURL, "/"),
+		authorization)
+
+	// Create new request to auth URL with same method, headers and new body copy
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, authURLWithToken,
+		bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		log.Error("performAuthCallback failed to create request", "err", err)
+		return "", fmt.Errorf("failed to create auth request: %w", err)
 	}
 
-	// Forward headers
-	req.Header.Set("Content-Type", "application/json")
+	// Copy original headers
+	req.Header = r.Header.Clone()
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	// Use the server's auth client
+	resp, err := s.authClient.Do(req)
 	if err != nil {
+		log.Error("performAuthCallback request failed", "err", err)
 		return "", fmt.Errorf("auth callback failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("auth callback failed with status: %d", resp.StatusCode)
+	// Only reject if we get a 401
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", fmt.Errorf("unauthorized")
 	}
 
-	return apiKey, nil
-	*/
+	return authorization, nil
 }
 
 func randStr(l int) string {
@@ -867,7 +867,6 @@ func GetAuthCtx(ctx context.Context) string {
 	if !ok {
 		return "none"
 	}
-
 	return authUser
 }
 
