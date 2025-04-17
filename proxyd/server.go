@@ -541,6 +541,15 @@ func (s *Server) handleBatchRPC(ctx context.Context, reqs []json.RawMessage, isL
 			res, sb, err := s.BackendGroups[group.backendGroup].Forward(ctx, createBatchRequest(elems), isBatch)
 			servedBy[sb] = true
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					log.Debug(
+						"context canceled while forwarding RPC batch",
+						"batch_size", len(elems),
+						"backend_group", group,
+						"req_id", GetReqID(ctx),
+					)
+					return nil, false, "", err
+				}
 				if errors.Is(err, ErrConsensusGetReceiptsCantBeBatched) ||
 					errors.Is(err, ErrConsensusGetReceiptsInvalidTarget) {
 					return nil, false, "", err

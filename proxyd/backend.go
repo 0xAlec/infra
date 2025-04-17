@@ -805,6 +805,14 @@ func (bg *BackendGroup) Forward(ctx context.Context, rpcReqs []*RPCReq, isBatch 
 	backendResp := <-ch
 
 	if backendResp.error != nil {
+		if errors.Is(backendResp.error, context.Canceled) {
+			log.Debug(
+				"context canceled while serving requests",
+				"req_id", GetReqID(ctx),
+				"auth", GetAuthCtx(ctx),
+			)
+			return backendResp.RPCRes, backendResp.ServedBy, backendResp.error
+		}
 		log.Error("error serving requests",
 			"req_id", GetReqID(ctx),
 			"auth", GetAuthCtx(ctx),
@@ -1445,6 +1453,15 @@ func (bg *BackendGroup) ForwardRequestToBackendGroup(
 					"name", back.Name,
 					"auth", GetAuthCtx(ctx),
 					"req_id", GetReqID(ctx),
+				)
+				continue
+			}
+			if errors.Is(err, context.Canceled) {
+				log.Debug(
+					"context canceled while forwarding request",
+					"name", back.Name,
+					"req_id", GetReqID(ctx),
+					"auth", GetAuthCtx(ctx),
 				)
 				continue
 			}
